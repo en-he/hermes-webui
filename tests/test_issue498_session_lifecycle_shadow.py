@@ -376,8 +376,31 @@ def test_malformed_sidecar_blocks(tmp_path):
     db_path = tmp_path / "state.db"
     _make_state_db(db_path, [{"id": "good1", "pinned": 0, "archived": 0}])
     diag = compute_aggregate_diagnostics(session_dir, db_path, profile="default")
+    assert diag["total_lineages"] == 2
     assert diag["matched"] == 1
-    assert diag["blocked"]["ambiguous"] >= 1
+    assert diag["blocked"]["ambiguous"] == 1
+    assert diag["blocked"]["unreadable"] == 0
+    dumped = json.dumps(diag)
+    assert "bad.json" not in dumped
+    assert "good1" not in dumped
+
+
+def test_unanchorable_malformed_sidecar_seeds_once(tmp_path):
+    from api.session_metadata_sync import compute_aggregate_diagnostics
+
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    (session_dir / " .json").write_text("{ not json", encoding="utf-8")
+    db_path = tmp_path / "state.db"
+    _make_state_db(db_path, [])
+
+    diag = compute_aggregate_diagnostics(session_dir, db_path, profile="default")
+
+    assert diag["total_lineages"] == 0
+    assert diag["matched"] == 0
+    assert diag["blocked"]["ambiguous"] == 1
+    assert diag["blocked"]["unreadable"] == 0
+    assert " .json" not in json.dumps(diag)
 
 
 def test_id_mismatch_blocks(tmp_path):
@@ -404,8 +427,14 @@ def test_id_mismatch_blocks(tmp_path):
     db_path = tmp_path / "state.db"
     _make_state_db(db_path, [{"id": "good1", "pinned": 0, "archived": 0}])
     diag = compute_aggregate_diagnostics(session_dir, db_path, profile="default")
+    assert diag["total_lineages"] == 3
     assert diag["matched"] == 1
-    assert diag["blocked"]["ambiguous"] >= 1
+    assert diag["blocked"]["ambiguous"] == 2
+    assert diag["blocked"]["unreadable"] == 0
+    dumped = json.dumps(diag)
+    assert "payload_id" not in dumped
+    assert "file_id" not in dumped
+    assert "good1" not in dumped
 
 
 def test_messages_invalid_blocks(tmp_path):
@@ -1316,7 +1345,7 @@ def test_core_parent_authority_sidecar_cannot_overwrite_none(tmp_path):
     assert child not in dumped
     from api.session_metadata_sync import _inventory_sidecars, _inventory_core_all
 
-    sidecars, _, _, _ = _inventory_sidecars(session_dir, "default")
+    sidecars, _, _, _, _ = _inventory_sidecars(session_dir, "default")
     core_all, _, _, _ = _inventory_core_all(db_path)
     rows = _rows_for_canonical_continuation(sidecars, {k: v for k, v in core_all.items() if v.get("trusted")})
     assert rows[child]["parent_session_id"] is None
@@ -1891,3 +1920,64 @@ def test_audit_blocks_continuation_cycle_deterministically(tmp_path):
     assert diag3["total_core_lineages"] == 1
     assert child_id not in json.dumps(diag3)
     assert secret_child not in json.dumps(diag3)
+
+
+def test_profile_mismatch_counted_once_via_blocked_lineage_exact(tmp_path):
+    from api.session_metadata_sync import compute_aggregate_diagnostics
+
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    _write_sidecar(session_dir, "good1", pinned=False, archived=False, profile="default", messages=[{"role": "user", "content": "hi"}])
+    _write_sidecar(session_dir, "other1", pinned=False, archived=False, profile="other", messages=[{"role": "user", "content": "hi"}])
+    db_path = tmp_path / "state.db"
+    _make_state_db(db_path, [{"id": "good1", "pinned": 0, "archived": 0}])
+    diag = compute_aggregate_diagnostics(session_dir, db_path, profile="default")
+    assert diag["total_lineages"] == 2
+    assert diag["matched"] == 1
+    assert diag["blocked"]["ambiguous"] == 1
+    assert diag["blocked"]["unreadable"] == 0
+    dumped = json.dumps(diag)
+    assert "other1" not in dumped
+    assert "good1" not in dumped
+    assert diag["blocked"]["ambiguous"] != 2
+
+
+def test_invalid_core_id_no_lineage_not_double_counted_exact(tmp_path):
+    from api.session_metadata_sync import compute_aggregate_diagnostics
+
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    _write_sidecar(session_dir, "good1", pinned=False, archived=False, profile="default", messages=[{"role": "user", "content": "hi"}])
+    db_path = tmp_path / "state.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("CREATE TABLE sessions (id PRIMARY KEY, source TEXT, pinned INTEGER, archived INTEGER, started_at REAL)")
+    conn.execute("INSERT INTO sessions (id, source, pinned, archived, started_at) VALUES (42, 'webui', 0, 0, 1000.0)")
+    conn.execute("INSERT INTO sessions (id, source, pinned, archived, started_at) VALUES ('good1', 'webui', 0, 0, 1000.0)")
+    conn.commit()
+    conn.close()
+    diag = compute_aggregate_diagnostics(session_dir, db_path, profile="default")
+    assert diag["total_lineages"] == 1
+    assert diag["matched"] == 1
+    assert diag["blocked"]["ambiguous"] == 1
+    assert diag["blocked"]["unreadable"] == 0
+    assert diag["total_core_lineages"] == 1
+    dumped = json.dumps(diag)
+    assert "good1" not in dumped
+    assert "42" not in dumped
+    assert "exception" not in dumped.lower()
+    assert "traceback" not in dumped.lower()
+    session_dir2 = tmp_path / "sessions2"
+    session_dir2.mkdir()
+    _write_sidecar(session_dir2, "good1b", pinned=False, archived=False, profile="default", messages=[{"role": "user", "content": "hi"}])
+    db2 = tmp_path / "state2.db"
+    conn2 = sqlite3.connect(str(db2))
+    conn2.execute("CREATE TABLE sessions (id PRIMARY KEY, source TEXT, pinned INTEGER, archived INTEGER, started_at REAL)")
+    conn2.execute("INSERT INTO sessions (id, source, pinned, archived, started_at) VALUES (?, 'webui', 0, 0, 1000.0)", (sqlite3.Binary(b"blobid"),))
+    conn2.execute("INSERT INTO sessions (id, source, pinned, archived, started_at) VALUES ('good1b', 'webui', 0, 0, 1000.0)")
+    conn2.commit()
+    conn2.close()
+    diag2 = compute_aggregate_diagnostics(session_dir2, db2, profile="default")
+    assert diag2["total_lineages"] == 1
+    assert diag2["blocked"]["ambiguous"] == 1
+    assert "blobid" not in json.dumps(diag2)
+    assert "good1b" not in json.dumps(diag2)

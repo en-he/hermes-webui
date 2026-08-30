@@ -293,22 +293,46 @@ def _is_trusted_core_source(row: dict) -> bool:
     return str(meta.get("session_source") or "").strip().lower() == "webui"
 
 
-def _inventory_sidecars(session_dir: Path, profile: str) -> tuple[dict[str, dict], dict, set[str], bool]:
+def _inventory_sidecars(session_dir: Path, profile: str) -> tuple[dict[str, dict], dict, set[str], bool, int]:
     out: dict[str, dict] = {}
     blocked: dict[str, int] = {"malformed": 0, "id_mismatch": 0, "messages_invalid": 0, "profile_mismatch": 0}
     blocked_ids: set[str] = set()
+    unanchorable_blocked = 0
     session_dir = Path(session_dir)
     sidecar_unreadable = False
     entries: list[Path] = []
+
+    def _record_blocked(kind: str, *raw_ids) -> None:
+        """Record rejected inventory evidence without double-counting anchors.
+
+        An admitted raw identity is counted later through its blocked lineage.
+        Only a rejected record with no admissible identity can seed the aggregate
+        ambiguity accumulator directly.
+        """
+        nonlocal sidecar_unreadable, unanchorable_blocked
+        try:
+            blocked[kind] += 1
+            anchors = {
+                raw_id
+                for raw_id in raw_ids
+                if isinstance(raw_id, str) and raw_id and raw_id.strip()
+            }
+            if anchors:
+                blocked_ids.update(anchors)
+            else:
+                unanchorable_blocked += 1
+        except Exception:
+            sidecar_unreadable = True
+
     try:
         if not session_dir.exists() or not session_dir.is_dir():
-            return out, blocked, blocked_ids, True
+            return out, blocked, blocked_ids, True, unanchorable_blocked
         try:
             entries = list(session_dir.glob("*.json"))
         except Exception:
-            return out, blocked, blocked_ids, True
+            return out, blocked, blocked_ids, True, unanchorable_blocked
     except Exception:
-        return out, blocked, blocked_ids, True
+        return out, blocked, blocked_ids, True, unanchorable_blocked
     for p in entries:
         if p.name.startswith("_") or p.name.startswith("."):
             continue
@@ -322,77 +346,35 @@ def _inventory_sidecars(session_dir: Path, profile: str) -> tuple[dict[str, dict
         try:
             data = json.loads(text)
         except Exception:
-            try:
-                blocked["malformed"] += 1
-                if file_sid_early:
-                    blocked_ids.add(file_sid_early)
-            except Exception:
-                sidecar_unreadable = True
+            _record_blocked("malformed", file_sid_early)
             continue
         if not isinstance(data, dict):
-            try:
-                blocked["malformed"] += 1
-                if file_sid_early:
-                    blocked_ids.add(file_sid_early)
-            except Exception:
-                sidecar_unreadable = True
+            _record_blocked("malformed", file_sid_early)
             continue
         file_sid_raw = p.stem
         raw_payload_sid = data.get("session_id")
         if not isinstance(raw_payload_sid, str) or not raw_payload_sid.strip():
-            try:
-                blocked["malformed"] += 1
-                if isinstance(file_sid_raw, str) and file_sid_raw.strip():
-                    blocked_ids.add(file_sid_raw)
-                if isinstance(raw_payload_sid, str) and raw_payload_sid.strip():
-                    blocked_ids.add(raw_payload_sid)
-            except Exception:
-                sidecar_unreadable = True
+            _record_blocked("malformed", file_sid_raw, raw_payload_sid)
             continue
         payload_sid = raw_payload_sid
         file_sid = file_sid_raw if isinstance(file_sid_raw, str) and file_sid_raw.strip() else ""
         if not file_sid:
-            try:
-                blocked["malformed"] += 1
-                if payload_sid:
-                    blocked_ids.add(payload_sid)
-            except Exception:
-                sidecar_unreadable = True
+            _record_blocked("malformed", payload_sid)
             continue
         if payload_sid != file_sid:
-            try:
-                blocked["id_mismatch"] += 1
-                if file_sid:
-                    blocked_ids.add(file_sid)
-                if payload_sid:
-                    blocked_ids.add(payload_sid)
-            except Exception:
-                sidecar_unreadable = True
+            _record_blocked("id_mismatch", file_sid, payload_sid)
             continue
         sid = payload_sid
         if not sid:
-            try:
-                blocked["malformed"] += 1
-                if file_sid:
-                    blocked_ids.add(file_sid)
-            except Exception:
-                sidecar_unreadable = True
+            _record_blocked("malformed", file_sid)
             continue
         prof = data.get("profile")
         if not isinstance(prof, str) or not prof.strip() or prof != profile:
-            try:
-                blocked["profile_mismatch"] += 1
-                blocked_ids.add(sid)
-            except Exception:
-                sidecar_unreadable = True
+            _record_blocked("profile_mismatch", sid)
             continue
         msgs = data.get("messages")
         if not isinstance(msgs, list):
-            try:
-                blocked["messages_invalid"] += 1
-                blocked_ids.add(sid)
-            except Exception:
-                sidecar_unreadable = True
+            _record_blocked("messages_invalid", sid)
             continue
         try:
             pinned = _tri_state_sidecar_flag(data, "pinned")
@@ -410,11 +392,7 @@ def _inventory_sidecars(session_dir: Path, profile: str) -> tuple[dict[str, dict
             sidecar_unreadable = True
             continue
         if kind == "malformed":
-            try:
-                blocked["malformed"] += 1
-                blocked_ids.add(sid)
-            except Exception:
-                sidecar_unreadable = True
+            _record_blocked("malformed", sid)
             continue
         out[sid] = {
             "session_id": sid,
@@ -428,8 +406,8 @@ def _inventory_sidecars(session_dir: Path, profile: str) -> tuple[dict[str, dict
             "raw_started_at": started_at,
         }
     if sidecar_unreadable:
-        return out, blocked, blocked_ids, True
-    return out, blocked, blocked_ids, False
+        return out, blocked, blocked_ids, True, unanchorable_blocked
+    return out, blocked, blocked_ids, False, unanchorable_blocked
 
 
 def _inventory_core_all(db_path: Path) -> tuple[dict[str, dict], bool, int, set[str]]:
@@ -620,9 +598,12 @@ def compute_aggregate_diagnostics(session_dir: Path, db_path: Path, profile) -> 
     blocked, never compared.
     """
     profile = _validate_profile(profile)
-    inv_result = _inventory_sidecars(session_dir, profile)
+    inv_result: tuple = _inventory_sidecars(session_dir, profile)
     sidecar_unreadable = False
-    if len(inv_result) == 4:
+    unanchorable_sidecar_blocked = 0
+    if len(inv_result) == 5:
+        sidecars, inv_blocked, inv_blocked_ids, sidecar_unreadable, unanchorable_sidecar_blocked = inv_result
+    elif len(inv_result) == 4:
         sidecars, inv_blocked, inv_blocked_ids, sidecar_unreadable = inv_result
     elif len(inv_result) == 3:
         sidecars, inv_blocked, inv_blocked_ids = inv_result
@@ -848,7 +829,10 @@ def compute_aggregate_diagnostics(session_dir: Path, db_path: Path, profile) -> 
     sidecar_only_msgful = 0
     core_only = 0
     blocked_active = 0
-    blocked_ambiguous = inv_blocked_total
+    # Anchored sidecar rejections are counted once when their blocked lineage
+    # is visited below. Only unanchorable sidecar records and invalid core IDs
+    # without an admissible lineage identity seed the aggregate directly.
+    blocked_ambiguous = invalid_core_blocked + unanchorable_sidecar_blocked
 
     effective_unreadable = blocked_unreadable or blocked_unreadable_sidecar
     if sidecar_unreadable:
